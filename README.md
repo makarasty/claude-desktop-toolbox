@@ -19,7 +19,17 @@ Claude reads its chat list only when an account starts, so a moved chat appears 
 
 Double-click `claude-toolbox.bat` and pick from the menu. No arguments needed.
 
+## Accounts it can see
+
+- Your normal Claude install (`%APPDATA%\Claude`), shown as `default`.
+- Extra accounts made with option 1 (`%LOCALAPPDATA%\Claude-Profiles\<name>`).
+
 ## Notes
 
 - Windows only (needs the Claude desktop app installed).
 - To move a chat into an account, open that account and sign in once first.
+- `Replace` keeps a `.bak` next to the file it changes, so you can undo.
+
+## Heads up
+
+This tool reads and writes Claude Desktop's own on-disk files, which are **not a public API**. A future Claude update could change that layout and break the tool. Tested on Claude for Windows `1.20186.0.0`. It never edits your conversations, only the small pointer files that list them.

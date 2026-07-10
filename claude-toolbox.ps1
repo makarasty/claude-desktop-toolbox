@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
-$Root = Join-Path $env:LOCALAPPDATA 'Claude-Profiles'
+$ProfileRoot = Join-Path $env:LOCALAPPDATA 'Claude-Profiles'
+$DefaultDir  = Join-Path $env:APPDATA 'Claude'
 
 function Pause-Menu { Write-Host ""; Read-Host "Press Enter to go back to the menu" | Out-Null }
 
@@ -34,7 +35,7 @@ function Select-Menu([string]$prompt, [array]$items, [scriptblock]$label) {
 }
 
 function Find-ClaudeExe {
-    $pkg = Get-AppxPackage -Name *Claude* -ErrorAction SilentlyContinue | Select-Object -First 1
+    try { $pkg = Get-AppxPackage -Name *Claude* -ErrorAction SilentlyContinue | Select-Object -First 1 } catch { $pkg = $null }
     if ($pkg) {
         foreach ($p in @((Join-Path $pkg.InstallLocation 'app\Claude.exe'), (Join-Path $pkg.InstallLocation 'Claude.exe'))) {
             if (Test-Path $p) { return $p }
@@ -42,33 +43,60 @@ function Find-ClaudeExe {
     }
     foreach ($p in @("$env:LOCALAPPDATA\AnthropicClaude\Claude.exe",
                      "$env:LOCALAPPDATA\Programs\Claude\Claude.exe",
-                     "$env:ProgramFiles\Claude\Claude.exe")) {
-        if (Test-Path $p) { return $p }
+                     "$env:LOCALAPPDATA\Programs\claude\Claude.exe",
+                     "$env:ProgramFiles\Claude\Claude.exe",
+                     "${env:ProgramFiles(x86)}\Claude\Claude.exe")) {
+        if ($p -and (Test-Path $p)) { return $p }
+    }
+    # Direct-download (Squirrel) install: %LOCALAPPDATA%\AnthropicClaude\app-<version>\Claude.exe (use newest)
+    foreach ($base in @("$env:LOCALAPPDATA\AnthropicClaude", "$env:LOCALAPPDATA\Programs\claude")) {
+        if (Test-Path $base) {
+            $exe = Get-ChildItem $base -Directory -Filter 'app-*' -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending |
+                   ForEach-Object { Join-Path $_.FullName 'Claude.exe' } |
+                   Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($exe) { return $exe }
+        }
     }
     return $null
 }
 
+# Every Claude window is a data dir. The plain install uses %APPDATA%\Claude;
+# extra accounts made by this tool live under %LOCALAPPDATA%\Claude-Profiles\<name>.
 function Get-Accounts {
-    if (-not (Test-Path $Root)) { return @() }
-    Get-ChildItem $Root -Directory | Where-Object {
-        Test-Path (Join-Path $_.FullName 'claude-code-sessions')
-    } | ForEach-Object {
-        $cnt = (Get-ChildItem (Join-Path $_.FullName 'claude-code-sessions') -Recurse -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
-        [pscustomobject]@{ Name = $_.Name; Dir = $_.FullName; Count = $cnt }
+    $dirs = @()
+    if (Test-Path (Join-Path $DefaultDir 'claude-code-sessions')) {
+        $dirs += [pscustomobject]@{ Name='default'; Dir=$DefaultDir; IsDefault=$true }
+    }
+    if (Test-Path $ProfileRoot) {
+        Get-ChildItem $ProfileRoot -Directory | Where-Object {
+            Test-Path (Join-Path $_.FullName 'claude-code-sessions')
+        } | ForEach-Object {
+            $dirs += [pscustomobject]@{ Name=$_.Name; Dir=$_.FullName; IsDefault=$false }
+        }
+    }
+    $dirs | ForEach-Object {
+        $cnt = (Get-ChildItem (Join-Path $_.Dir 'claude-code-sessions') -Recurse -Filter 'local_*.json' -File -ErrorAction SilentlyContinue).Count
+        $_ | Add-Member NoteProperty Count $cnt -PassThru
     }
 }
 
-function Get-Leaf([string]$profileDir) {
-    $base = Join-Path $profileDir 'claude-code-sessions'
+# One account can be signed into more than one org, giving several store folders.
+function Resolve-Leaf([string]$accountDir) {
+    $base = Join-Path $accountDir 'claude-code-sessions'
     if (-not (Test-Path $base)) { throw "That account has no chats yet. Open it once and sign in first." }
-    $leaf = Get-ChildItem $base -Directory | ForEach-Object { Get-ChildItem $_.FullName -Directory } |
-        Sort-Object { (Get-ChildItem $_.FullName -Filter 'local_*.json' -File).Count } -Descending | Select-Object -First 1
-    if (-not $leaf) { throw "That account has no chat store yet. Open it once and sign in first." }
-    return $leaf.FullName
+    $leaves = @(Get-ChildItem $base -Directory | ForEach-Object { Get-ChildItem $_.FullName -Directory })
+    if ($leaves.Count -eq 0) { throw "That account has no chat store yet. Open it once and sign in first." }
+    if ($leaves.Count -eq 1) { return $leaves[0].FullName }
+    $pick = Select-Menu "This account has more than one workspace. Pick where to put it:" $leaves {
+        param($x) "{0}  ({1} chats)" -f $x.Name, (Get-ChildItem $x.FullName -Filter 'local_*.json' -File).Count
+    }
+    if (-not $pick) { throw "Cancelled." }
+    return $pick.FullName
 }
 
-function Get-Chats([string]$profileDir) {
-    $base = Join-Path $profileDir 'claude-code-sessions'
+function Get-Chats([string]$accountDir) {
+    $base = Join-Path $accountDir 'claude-code-sessions'
     if (-not (Test-Path $base)) { return @() }
     Get-ChildItem $base -Recurse -Filter 'local_*.json' -File | ForEach-Object {
         try { $o = Read-Json $_.FullName } catch { return }
@@ -78,14 +106,26 @@ function Get-Chats([string]$profileDir) {
     } | Sort-Object When -Descending
 }
 
+function Get-TranscriptRoot {
+    if ($env:CLAUDE_CONFIG_DIR) { return (Join-Path $env:CLAUDE_CONFIG_DIR 'projects') }
+    return (Join-Path $env:USERPROFILE '.claude\projects')
+}
+
+function Test-Transcript([string]$cli) {
+    if (-not $cli) { return $false }
+    $r = Get-TranscriptRoot
+    if (-not (Test-Path $r)) { return $false }
+    [bool](Get-ChildItem $r -Recurse -Filter "$cli.jsonl" -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
 function Pick-Account([string]$prompt) {
     $accts = @(Get-Accounts)
-    if ($accts.Count -eq 0) { Write-Host "No accounts found. Use option 1 to set them up first." -ForegroundColor Yellow; return $null }
+    if ($accts.Count -eq 0) { Write-Host "No Claude accounts found. Use option 1 to set them up first." -ForegroundColor Yellow; return $null }
     Select-Menu $prompt $accts { param($x) "{0}  ({1} chats)" -f $x.Name, $x.Count }
 }
 
-function Pick-Chat([string]$prompt, [string]$profileDir) {
-    $chats = @(Get-Chats $profileDir)
+function Pick-Chat([string]$prompt, [string]$accountDir) {
+    $chats = @(Get-Chats $accountDir)
     if ($chats.Count -eq 0) { Write-Host "That account has no chats." -ForegroundColor Yellow; return $null }
     $flt = Read-Host "Type part of the chat name to filter (or just Enter to list all)"
     if ($flt) { $chats = @($chats | Where-Object { $_.Title -like "*$flt*" }) }
@@ -102,11 +142,12 @@ function Invoke-SetupAccounts {
 
     $namesRaw = Read-Host "Enter account names separated by commas (example: main,dev)"
     if (-not $namesRaw) { $namesRaw = 'main,dev' }
-    $names = $namesRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    $names = $namesRaw.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '[\\/:*?"<>|]' }
+    if ($names.Count -eq 0) { Write-Host "No valid names." -ForegroundColor Red; return }
 
-    New-Item -ItemType Directory -Force -Path $Root | Out-Null
+    New-Item -ItemType Directory -Force -Path $ProfileRoot | Out-Null
 
-    $launcher = Join-Path $Root 'launch-claude.ps1'
+    $launcher = Join-Path $ProfileRoot 'launch-claude.ps1'
     $launcherText = @'
 param([Parameter(Mandatory)][string]$DataDir)
 $pkg = Get-AppxPackage -Name *Claude* | Select-Object -First 1
@@ -114,14 +155,25 @@ if ($pkg) {
     $exe = Join-Path $pkg.InstallLocation 'app\Claude.exe'
     if (-not (Test-Path $exe)) { $exe = Join-Path $pkg.InstallLocation 'Claude.exe' }
 } else {
-    $exe = "$env:LOCALAPPDATA\AnthropicClaude\Claude.exe"
+    $exe = $null
+    foreach ($p in @("$env:LOCALAPPDATA\AnthropicClaude\Claude.exe",
+                     "$env:LOCALAPPDATA\Programs\Claude\Claude.exe",
+                     "$env:ProgramFiles\Claude\Claude.exe")) {
+        if (Test-Path $p) { $exe = $p; break }
+    }
+    if (-not $exe) {
+        $exe = Get-ChildItem "$env:LOCALAPPDATA\AnthropicClaude" -Directory -Filter 'app-*' -ErrorAction SilentlyContinue |
+               Sort-Object LastWriteTime -Descending |
+               ForEach-Object { Join-Path $_.FullName 'Claude.exe' } |
+               Where-Object { Test-Path $_ } | Select-Object -First 1
+    }
 }
-if (-not (Test-Path $exe)) { exit 1 }
+if (-not $exe -or -not (Test-Path $exe)) { exit 1 }
 Start-Process -FilePath $exe -ArgumentList ('--user-data-dir="{0}"' -f $DataDir)
 '@
     Write-TextNoBom $launcher $launcherText
 
-    $ico = Join-Path $Root 'claude.ico'
+    $ico = Join-Path $ProfileRoot 'claude.ico'
     try {
         Add-Type -AssemblyName System.Drawing
         $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
@@ -134,12 +186,12 @@ Start-Process -FilePath $exe -ArgumentList ('--user-data-dir="{0}"' -f $DataDir)
     $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $wsh = New-Object -ComObject WScript.Shell
     foreach ($n in $names) {
-        $data = Join-Path $Root $n
+        $data = Join-Path $ProfileRoot $n
         New-Item -ItemType Directory -Force -Path $data | Out-Null
         $lnk = $wsh.CreateShortcut((Join-Path $startMenu ("Claude - $n.lnk")))
         $lnk.TargetPath       = $psExe
         $lnk.Arguments        = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -DataDir "{1}"' -f $launcher, $data
-        $lnk.WorkingDirectory = $Root
+        $lnk.WorkingDirectory = $ProfileRoot
         $lnk.IconLocation     = $iconRef
         $lnk.WindowStyle      = 7
         $lnk.Description       = "Claude - $n"
@@ -156,7 +208,12 @@ function Invoke-CopyChat {
     $srcAcct = Pick-Account "Which account is the chat in now?"; if (-not $srcAcct) { return }
     $chat    = Pick-Chat "Pick the chat to copy:" $srcAcct.Dir;   if (-not $chat) { return }
     if (-not $chat.cliSessionId) { Write-Host "This chat has no history to point at." -ForegroundColor Red; return }
+    if (-not (Test-Transcript $chat.cliSessionId)) {
+        Write-Host "Warning: the conversation file for this chat was not found - the copy may open empty." -ForegroundColor Yellow
+        if ((Read-Host "Copy anyway? (Y/N)") -notmatch '^(?i)y') { Write-Host "Cancelled."; return }
+    }
     $dstAcct = Pick-Account "Copy it INTO which account?";        if (-not $dstAcct) { return }
+    $leaf    = Resolve-Leaf $dstAcct.Dir
 
     $rename = Read-Host "New name for the copy (or Enter to keep '$($chat.Title)')"
     $o = $chat.Obj
@@ -165,7 +222,7 @@ function Invoke-CopyChat {
     foreach ($k in 'enabledMcpTools','remoteMcpServersConfig','alwaysAllowedReasons','sessionPermissionUpdates') {
         if ($o.PSObject.Properties[$k]) { $o.PSObject.Properties.Remove($k) }
     }
-    $dst = Join-Path (Get-Leaf $dstAcct.Dir) ("{0}.json" -f $o.sessionId)
+    $dst = Join-Path $leaf ("{0}.json" -f $o.sessionId)
     Write-JsonNoBom $dst $o
     Write-Host ""
     Write-Host ("Copied '{0}' into account '{1}'." -f $o.title, $dstAcct.Name) -ForegroundColor Green
@@ -178,8 +235,13 @@ function Invoke-ReplaceChat {
     $srcAcct = Pick-Account "Which account holds the history you want to show?"; if (-not $srcAcct) { return }
     $src     = Pick-Chat "Pick the chat whose history to use (source):" $srcAcct.Dir; if (-not $src) { return }
     if (-not $src.cliSessionId) { Write-Host "That source chat has no history." -ForegroundColor Red; return }
+    if (-not (Test-Transcript $src.cliSessionId)) {
+        Write-Host "Warning: the conversation file for the source was not found - the result may be empty." -ForegroundColor Yellow
+        if ((Read-Host "Continue anyway? (Y/N)") -notmatch '^(?i)y') { Write-Host "Cancelled."; return }
+    }
     $dstAcct = Pick-Account "Which account has the chat to overwrite?"; if (-not $dstAcct) { return }
     $tgt     = Pick-Chat "Pick the chat to OVERWRITE (its name stays, content changes):" $dstAcct.Dir; if (-not $tgt) { return }
+    if ($tgt.Path -eq $src.Path) { Write-Host "Source and target are the same chat. Nothing to do." -ForegroundColor Yellow; return }
 
     Write-Host ""
     Write-Host ("This will make '{0}' show the history of '{1}'." -f $tgt.Title, $src.Title) -ForegroundColor Yellow
@@ -193,13 +255,22 @@ function Invoke-ReplaceChat {
     Offer-Restart $dstAcct
 }
 
-function Get-AccountProcs([string]$acctDir) {
-    Get-CimInstance Win32_Process -Filter "Name='Claude.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains($acctDir.ToLower()) }
+# Match the running windows of ONE account.
+#  - extra accounts always carry --user-data-dir="<their dir>"; match that exactly
+#    (the trailing boundary stops 'main' from also matching 'main2').
+#  - the plain install has no --user-data-dir and no Claude-Profiles path.
+function Get-AccountProcs($acct) {
+    $all = @(Get-CimInstance Win32_Process -Filter "Name='Claude.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine })
+    if ($acct.IsDefault) {
+        $all | Where-Object { $_.CommandLine -notmatch '--user-data-dir' -and $_.CommandLine -notmatch 'Claude-Profiles' }
+    } else {
+        $pat = [regex]::Escape($acct.Dir) + '[\\"\s]'
+        $all | Where-Object { $_.CommandLine -match $pat }
+    }
 }
 
 function Restart-Account($acct) {
-    $procs = @(Get-AccountProcs $acct.Dir)
+    $procs = @(Get-AccountProcs $acct)
     Write-Host ""
     Write-Host ("WARNING: this closes the '{0}' Claude window." -f $acct.Name) -ForegroundColor Yellow
     Write-Host "Finish anything you are typing there first. A running task will be interrupted."
@@ -207,16 +278,17 @@ function Restart-Account($acct) {
     if ((Read-Host "Type YES to restart it now") -ne 'YES') { Write-Host "Left it alone."; return }
 
     foreach ($p in $procs) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {} }
-    for ($i = 0; $i -lt 40 -and (@(Get-AccountProcs $acct.Dir).Count -gt 0); $i++) { Start-Sleep -Milliseconds 250 }
+    for ($i = 0; $i -lt 40 -and (@(Get-AccountProcs $acct).Count -gt 0); $i++) { Start-Sleep -Milliseconds 250 }
 
-    $launcher = Join-Path $Root 'launch-claude.ps1'
-    if (Test-Path $launcher) {
+    $launcher = Join-Path $ProfileRoot 'launch-claude.ps1'
+    if (-not $acct.IsDefault -and (Test-Path $launcher)) {
         Start-Process (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
             -ArgumentList ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -DataDir "{1}"' -f $launcher, $acct.Dir)
     } else {
         $exe = Find-ClaudeExe
-        if ($exe) { Start-Process $exe -ArgumentList ('--user-data-dir="{0}"' -f $acct.Dir) }
-        else { Write-Host "Could not find Claude.exe to relaunch. Start '$($acct.Name)' from the Start Menu." -ForegroundColor Red; return }
+        if (-not $exe) { Write-Host "Could not find Claude.exe to relaunch. Start '$($acct.Name)' yourself." -ForegroundColor Red; return }
+        if ($acct.IsDefault) { Start-Process $exe }
+        else { Start-Process $exe -ArgumentList ('--user-data-dir="{0}"' -f $acct.Dir) }
     }
     Write-Host ("Restarted '{0}'." -f $acct.Name) -ForegroundColor Green
 }
@@ -233,7 +305,7 @@ function Invoke-RestartMenu {
     Restart-Account $acct
 }
 
-while ($true) {
+:menu while ($true) {
     Clear-Host
     Write-Host "==============================================" -ForegroundColor DarkCyan
     Write-Host "            Claude Desktop Toolbox            " -ForegroundColor White
@@ -253,7 +325,7 @@ while ($true) {
         '2' { try { Invoke-CopyChat }      catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '3' { try { Invoke-ReplaceChat }   catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '4' { try { Invoke-RestartMenu }   catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
-        '5' { break }
+        '5' { break menu }
         default { }
     }
 }
