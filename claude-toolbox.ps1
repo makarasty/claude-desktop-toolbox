@@ -1,44 +1,16 @@
-# ============================================================================
-#  Claude Desktop Toolbox
-#  A small menu app to run several Claude Desktop accounts and move chats
-#  between them. Works on any Windows PC (uses only environment paths).
-#
-#  WHAT YOU CAN DO
-#    1. Set up extra Claude accounts  - separate logins, each its own window,
-#                                       survives Claude updates.
-#    2. Copy a chat into another account.
-#    3. Replace a chat with another chat's history.
-#    4. Restart an account window     - needed so a moved chat shows up.
-#
-#  HOW MOVING A CHAT WORKS (plain version)
-#    Every account keeps a small list file per chat (a "pointer").
-#    The real conversation is stored once and shared by all accounts.
-#    Copying a chat just writes a new pointer in the other account - fast,
-#    and it never duplicates or damages the original conversation.
-#
-#  IMPORTANT
-#    Claude reads its chat list only when an account starts. A moved chat
-#    appears only after you RESTART that account window. This app can do
-#    that for you (option 4), or you can quit and reopen it yourself.
-#
-#  Just double-click claude-toolbox.bat. No arguments needed.
-# ============================================================================
-
 $ErrorActionPreference = 'Stop'
 $Root = Join-Path $env:LOCALAPPDATA 'Claude-Profiles'
-
-# ---- low level helpers ------------------------------------------------------
 
 function Pause-Menu { Write-Host ""; Read-Host "Press Enter to go back to the menu" | Out-Null }
 
 function Read-Json([string]$path) {
     $raw = [System.IO.File]::ReadAllText($path)
-    if ($raw.Length -gt 0 -and $raw[0] -eq [char]0xFEFF) { $raw = $raw.Substring(1) }  # tolerate BOM
+    if ($raw.Length -gt 0 -and $raw[0] -eq [char]0xFEFF) { $raw = $raw.Substring(1) }
     return ($raw | ConvertFrom-Json)
 }
 
 function Write-JsonNoBom([string]$path, $obj) {
-    # MUST be UTF-8 without BOM, or Claude fails to read the file and the chat vanishes.
+    # Must be UTF-8 without BOM, or Claude cannot read the file.
     $json = $obj | ConvertTo-Json -Depth 40 -Compress
     [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
 }
@@ -62,7 +34,6 @@ function Select-Menu([string]$prompt, [array]$items, [scriptblock]$label) {
 }
 
 function Find-ClaudeExe {
-    # Works whether Claude is installed as MSIX (Store style) or a normal app.
     $pkg = Get-AppxPackage -Name *Claude* -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($pkg) {
         foreach ($p in @((Join-Path $pkg.InstallLocation 'app\Claude.exe'), (Join-Path $pkg.InstallLocation 'Claude.exe'))) {
@@ -76,8 +47,6 @@ function Find-ClaudeExe {
     }
     return $null
 }
-
-# ---- account / session discovery -------------------------------------------
 
 function Get-Accounts {
     if (-not (Test-Path $Root)) { return @() }
@@ -118,20 +87,16 @@ function Pick-Account([string]$prompt) {
 function Pick-Chat([string]$prompt, [string]$profileDir) {
     $chats = @(Get-Chats $profileDir)
     if ($chats.Count -eq 0) { Write-Host "That account has no chats." -ForegroundColor Yellow; return $null }
-    # let the user filter by typing part of a title (optional)
     $flt = Read-Host "Type part of the chat name to filter (or just Enter to list all)"
     if ($flt) { $chats = @($chats | Where-Object { $_.Title -like "*$flt*" }) }
     if ($chats.Count -eq 0) { Write-Host "Nothing matched '$flt'." -ForegroundColor Yellow; return $null }
     Select-Menu $prompt $chats { param($x) $x.Title }
 }
 
-# ---- action: set up accounts (from your account-duplication script) ---------
-
 function Invoke-SetupAccounts {
     Write-Host ""
     Write-Host "Set up extra Claude accounts" -ForegroundColor Green
     Write-Host "Each name becomes its own Start Menu shortcut with a separate login."
-    Write-Host "These shortcuts keep working after Claude updates."
     $exe = Find-ClaudeExe
     if (-not $exe) { Write-Host "Could not find Claude.exe. Install the Claude desktop app first." -ForegroundColor Red; return }
 
@@ -141,7 +106,6 @@ function Invoke-SetupAccounts {
 
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
 
-    # launcher finds the current Claude version at click time (survives updates)
     $launcher = Join-Path $Root 'launch-claude.ps1'
     $launcherText = @'
 param([Parameter(Mandatory)][string]$DataDir)
@@ -157,7 +121,6 @@ Start-Process -FilePath $exe -ArgumentList ('--user-data-dir="{0}"' -f $DataDir)
 '@
     Write-TextNoBom $launcher $launcherText
 
-    # extract the icon once so shortcuts keep it after updates
     $ico = Join-Path $Root 'claude.ico'
     try {
         Add-Type -AssemblyName System.Drawing
@@ -185,10 +148,7 @@ Start-Process -FilePath $exe -ArgumentList ('--user-data-dir="{0}"' -f $DataDir)
     }
     Write-Host ""
     Write-Host "Done. Open each from the Start Menu and sign in once." -ForegroundColor Green
-    Write-Host "After signing in, that account will show up here for moving chats."
 }
-
-# ---- action: copy a chat ----------------------------------------------------
 
 function Invoke-CopyChat {
     Write-Host ""
@@ -212,12 +172,9 @@ function Invoke-CopyChat {
     Offer-Restart $dstAcct
 }
 
-# ---- action: replace a chat -------------------------------------------------
-
 function Invoke-ReplaceChat {
     Write-Host ""
     Write-Host "Replace a chat with another chat's history" -ForegroundColor Green
-    Write-Host "The chosen chat keeps its name but will show the other chat's messages."
     $srcAcct = Pick-Account "Which account holds the history you want to show?"; if (-not $srcAcct) { return }
     $src     = Pick-Chat "Pick the chat whose history to use (source):" $srcAcct.Dir; if (-not $src) { return }
     if (-not $src.cliSessionId) { Write-Host "That source chat has no history." -ForegroundColor Red; return }
@@ -228,15 +185,13 @@ function Invoke-ReplaceChat {
     Write-Host ("This will make '{0}' show the history of '{1}'." -f $tgt.Title, $src.Title) -ForegroundColor Yellow
     if ((Read-Host "Type YES to confirm") -ne 'YES') { Write-Host "Cancelled."; return }
 
-    Copy-Item $tgt.Path ("{0}.bak" -f $tgt.Path) -Force   # backup for undo
+    Copy-Item $tgt.Path ("{0}.bak" -f $tgt.Path) -Force
     $o = $tgt.Obj
     $o.cliSessionId = $src.cliSessionId
     Write-JsonNoBom $tgt.Path $o
-    Write-Host ("Done. Backup saved next to the file (.bak) in case you want to undo." ) -ForegroundColor Green
+    Write-Host "Done. Backup saved next to the file (.bak)." -ForegroundColor Green
     Offer-Restart $dstAcct
 }
-
-# ---- action: restart an account (so changes show up) ------------------------
 
 function Get-AccountProcs([string]$acctDir) {
     Get-CimInstance Win32_Process -Filter "Name='Claude.exe'" -ErrorAction SilentlyContinue |
@@ -252,7 +207,6 @@ function Restart-Account($acct) {
     if ((Read-Host "Type YES to restart it now") -ne 'YES') { Write-Host "Left it alone."; return }
 
     foreach ($p in $procs) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {} }
-    # wait until they are gone (max ~10s)
     for ($i = 0; $i -lt 40 -and (@(Get-AccountProcs $acct.Dir).Count -gt 0); $i++) { Start-Sleep -Milliseconds 250 }
 
     $launcher = Join-Path $Root 'launch-claude.ps1'
@@ -264,22 +218,20 @@ function Restart-Account($acct) {
         if ($exe) { Start-Process $exe -ArgumentList ('--user-data-dir="{0}"' -f $acct.Dir) }
         else { Write-Host "Could not find Claude.exe to relaunch. Start '$($acct.Name)' from the Start Menu." -ForegroundColor Red; return }
     }
-    Write-Host ("Restarted '{0}'. Your changes should be visible now." -f $acct.Name) -ForegroundColor Green
+    Write-Host ("Restarted '{0}'." -f $acct.Name) -ForegroundColor Green
 }
 
 function Offer-Restart($acct) {
     Write-Host ""
     Write-Host "Claude only sees this after the account restarts." -ForegroundColor Cyan
     if ((Read-Host "Restart '$($acct.Name)' now? (Y/N)") -match '^(?i)y') { Restart-Account $acct }
-    else { Write-Host "OK. Quit and reopen '$($acct.Name)' yourself when ready, or use menu option 4." }
+    else { Write-Host "OK. Quit and reopen '$($acct.Name)' yourself, or use menu option 4." }
 }
 
 function Invoke-RestartMenu {
     $acct = Pick-Account "Which account do you want to restart?"; if (-not $acct) { return }
     Restart-Account $acct
 }
-
-# ---- main menu --------------------------------------------------------------
 
 while ($true) {
     Clear-Host
@@ -293,7 +245,7 @@ while ($true) {
     Write-Host "  [1] Set up extra Claude accounts"
     Write-Host "  [2] Copy a chat into another account"
     Write-Host "  [3] Replace a chat with another chat's history"
-    Write-Host "  [4] Restart an account window (make changes show up)"
+    Write-Host "  [4] Restart an account window"
     Write-Host "  [5] Exit"
     Write-Host ""
     switch (Read-Host "Choose") {
