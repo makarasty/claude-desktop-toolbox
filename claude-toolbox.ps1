@@ -111,11 +111,57 @@ function Get-TranscriptRoot {
     return (Join-Path $env:USERPROFILE '.claude\projects')
 }
 
-function Test-Transcript([string]$cli) {
-    if (-not $cli) { return $false }
+function Find-TranscriptPath([string]$cli) {
+    if (-not $cli) { return $null }
     $r = Get-TranscriptRoot
-    if (-not (Test-Path $r)) { return $false }
-    [bool](Get-ChildItem $r -Recurse -Filter "$cli.jsonl" -File -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if (-not (Test-Path $r)) { return $null }
+    (Get-ChildItem $r -Recurse -Filter "$cli.jsonl" -File -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+}
+
+function Test-Transcript([string]$cli) { [bool](Find-TranscriptPath $cli) }
+
+function Get-DownloadsDir {
+    $d = Join-Path $env:USERPROFILE 'Downloads'
+    if (Test-Path $d) { return $d }
+    return $null
+}
+
+function Sanitize-Name([string]$s) {
+    $s = ($s -replace '[\\/:*?"<>|]', '_').Trim().TrimEnd('.')
+    if ($s.Length -gt 80) { $s = $s.Substring(0, 80).Trim() }
+    if (-not $s) { $s = 'chat' }
+    return $s
+}
+
+# Turn a raw transcript into a readable markdown conversation (user/assistant text only).
+function Render-Readable([string]$jsonlPath, [string]$title) {
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine("# $title")
+    [void]$sb.AppendLine()
+    foreach ($line in [System.IO.File]::ReadLines($jsonlPath)) {
+        if (-not $line.Trim()) { continue }
+        try { $o = $line | ConvertFrom-Json } catch { continue }
+        $msg = $o.message
+        if (-not $msg -or -not $msg.role) { continue }
+        $text = ''
+        if ($msg.content -is [string]) {
+            $text = $msg.content
+        } elseif ($msg.content) {
+            $parts = @()
+            foreach ($b in $msg.content) {
+                if ($b.type -eq 'text' -and $b.text) { $parts += $b.text }
+                elseif ($b.type -eq 'tool_use') { $parts += "_(used tool: $($b.name))_" }
+            }
+            $text = ($parts -join "`n")
+        }
+        if (-not $text) { continue }
+        $who = switch ($msg.role) { 'user' { 'User' } 'assistant' { 'Assistant' } default { $msg.role } }
+        [void]$sb.AppendLine("## $who")
+        [void]$sb.AppendLine()
+        [void]$sb.AppendLine($text)
+        [void]$sb.AppendLine()
+    }
+    $sb.ToString()
 }
 
 function Pick-Account([string]$prompt) {
@@ -255,6 +301,37 @@ function Invoke-ReplaceChat {
     Offer-Restart $dstAcct
 }
 
+function Invoke-ExportChat {
+    Write-Host ""
+    Write-Host "Export a chat to a file" -ForegroundColor Green
+    $acct = Pick-Account "Which account is the chat in?"; if (-not $acct) { return }
+    $chat = Pick-Chat "Pick the chat to export:" $acct.Dir;  if (-not $chat) { return }
+    $tx = Find-TranscriptPath $chat.cliSessionId
+    if (-not $tx) { Write-Host "Conversation file not found - nothing to export." -ForegroundColor Red; return }
+
+    $destChoices = @()
+    $desk = [Environment]::GetFolderPath('Desktop'); if ($desk -and (Test-Path $desk)) { $destChoices += [pscustomobject]@{ Name='Desktop'; Dir=$desk } }
+    $dl = Get-DownloadsDir; if ($dl) { $destChoices += [pscustomobject]@{ Name='Downloads'; Dir=$dl } }
+    if ($destChoices.Count -eq 0) { Write-Host "Could not find Desktop or Downloads." -ForegroundColor Red; return }
+    $dest = Select-Menu "Save where?" $destChoices { param($x) "{0}  ({1})" -f $x.Name, $x.Dir }; if (-not $dest) { return }
+
+    $fmt = Select-Menu "Which format?" @(
+        [pscustomobject]@{ Name='Readable text (.md)'; Key='md' },
+        [pscustomobject]@{ Name='Raw data (.jsonl)';   Key='raw' },
+        [pscustomobject]@{ Name='Both';                Key='both' }
+    ) { param($x) $x.Name }
+    if (-not $fmt) { return }
+
+    $short = ($chat.cliSessionId -split '-')[0]
+    $base  = Join-Path $dest.Dir ("{0} ({1})" -f (Sanitize-Name $chat.Title), $short)
+    $written = @()
+    if ($fmt.Key -in 'raw','both')  { Copy-Item $tx ($base + '.jsonl') -Force; $written += ($base + '.jsonl') }
+    if ($fmt.Key -in 'md','both')   { Write-TextNoBom ($base + '.md') (Render-Readable $tx $chat.Title); $written += ($base + '.md') }
+    Write-Host ""
+    Write-Host "Exported:" -ForegroundColor Green
+    $written | ForEach-Object { Write-Host "  $_" }
+}
+
 # Match the running windows of ONE account.
 #  - extra accounts always carry --user-data-dir="<their dir>"; match that exactly
 #    (the trailing boundary stops 'main' from also matching 'main2').
@@ -318,14 +395,16 @@ function Invoke-RestartMenu {
     Write-Host "  [2] Copy a chat into another account"
     Write-Host "  [3] Replace a chat with another chat's history"
     Write-Host "  [4] Restart an account window"
-    Write-Host "  [5] Exit"
+    Write-Host "  [5] Export a chat to Desktop or Downloads"
+    Write-Host "  [6] Exit"
     Write-Host ""
     switch (Read-Host "Choose") {
         '1' { try { Invoke-SetupAccounts } catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '2' { try { Invoke-CopyChat }      catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '3' { try { Invoke-ReplaceChat }   catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '4' { try { Invoke-RestartMenu }   catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
-        '5' { break menu }
+        '5' { try { Invoke-ExportChat }    catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
+        '6' { break menu }
         default { }
     }
 }
