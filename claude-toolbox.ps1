@@ -332,6 +332,84 @@ function Invoke-ExportChat {
     $written | ForEach-Object { Write-Host "  $_" }
 }
 
+function Get-ImportSourceDirs {
+    $dirs = @()
+    $desk = [Environment]::GetFolderPath('Desktop'); if ($desk -and (Test-Path $desk)) { $dirs += $desk }
+    $dl = Get-DownloadsDir; if ($dl) { $dirs += $dl }
+    $dirs | Select-Object -Unique
+}
+
+function Read-TranscriptMeta([string]$jsonlPath) {
+    $sid = $null; $cwd = $null; $n = 0
+    foreach ($line in [System.IO.File]::ReadLines($jsonlPath)) {
+        if (-not $line.Trim()) { continue }
+        try { $o = $line | ConvertFrom-Json } catch { continue }
+        if (-not $sid -and $o.sessionId) { $sid = $o.sessionId }
+        if (-not $cwd -and $o.cwd) { $cwd = $o.cwd }
+        if (($sid -and $cwd) -or (++$n -ge 50)) { break }
+    }
+    [pscustomobject]@{ SessionId=$sid; Cwd=$cwd }
+}
+
+# Claude names each transcript folder after the cwd, replacing \ / : . _ and spaces with -.
+function Encode-CwdFolder([string]$cwd) { $cwd -replace '[\\/:._ ]', '-' }
+
+function Invoke-ImportChat {
+    Write-Host ""
+    Write-Host "Import a chat from a file" -ForegroundColor Green
+    Write-Host "Looks for .jsonl chat files on your Desktop and in Downloads."
+    $files = @()
+    foreach ($d in @(Get-ImportSourceDirs)) {
+        Get-ChildItem $d -Filter '*.jsonl' -File -ErrorAction SilentlyContinue | ForEach-Object { $files += $_ }
+    }
+    if ($files.Count -eq 0) { Write-Host "No .jsonl chat files found on Desktop or in Downloads." -ForegroundColor Yellow; return }
+    $pick = Select-Menu "Pick a file to import:" @($files | Sort-Object LastWriteTime -Descending) {
+        param($x) "{0}   ({1} KB, in {2})" -f $x.Name, [int]($x.Length / 1KB), (Split-Path $x.DirectoryName -Leaf)
+    }
+    if (-not $pick) { return }
+
+    $meta = Read-TranscriptMeta $pick.FullName
+    if (-not $meta.SessionId) { Write-Host "This file is not a Claude chat (no sessionId inside)." -ForegroundColor Red; return }
+
+    $acct = Pick-Account "Import INTO which account?"; if (-not $acct) { return }
+    $leaf = Resolve-Leaf $acct.Dir
+    $template = @(Get-Chats $acct.Dir)[0]
+    if (-not $template) { Write-Host "Target account has no existing chat to copy settings from." -ForegroundColor Red; return }
+
+    $defTitle = [System.IO.Path]::GetFileNameWithoutExtension($pick.Name)
+    $title = Read-Host "Name for the imported chat (or Enter for '$defTitle')"
+    if (-not $title) { $title = $defTitle }
+
+    # Put the conversation file into Claude's shared store if it is not already there.
+    if (-not (Find-TranscriptPath $meta.SessionId)) {
+        $cwd = if ($meta.Cwd) { $meta.Cwd } else { $acct.Dir }
+        $folder = Join-Path (Get-TranscriptRoot) (Encode-CwdFolder $cwd)
+        New-Item -ItemType Directory -Force -Path $folder | Out-Null
+        Copy-Item $pick.FullName (Join-Path $folder ($meta.SessionId + '.jsonl')) -Force
+    }
+
+    # Build the index by cloning an existing one so the schema always matches.
+    $o = $template.Obj
+    $o.sessionId    = 'local_' + [guid]::NewGuid().ToString()
+    $o.cliSessionId = $meta.SessionId
+    if ($meta.Cwd) {
+        if ($o.PSObject.Properties['cwd'])       { $o.cwd = $meta.Cwd }
+        if ($o.PSObject.Properties['originCwd']) { $o.originCwd = $meta.Cwd }
+    }
+    $o.title = $title
+    if ($o.PSObject.Properties['titleSource']) { $o.titleSource = 'user' }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    foreach ($t in 'createdAt','lastActivityAt','lastFocusedAt') { if ($o.PSObject.Properties[$t]) { $o.$t = $now } }
+    foreach ($k in 'enabledMcpTools','remoteMcpServersConfig','alwaysAllowedReasons','sessionPermissionUpdates','writtenBranches') {
+        if ($o.PSObject.Properties[$k]) { $o.PSObject.Properties.Remove($k) }
+    }
+    $dst = Join-Path $leaf ($o.sessionId + '.json')
+    Write-JsonNoBom $dst $o
+    Write-Host ""
+    Write-Host ("Imported '{0}' into account '{1}'." -f $title, $acct.Name) -ForegroundColor Green
+    Offer-Restart $acct
+}
+
 # Match the running windows of ONE account.
 #  - extra accounts always carry --user-data-dir="<their dir>"; match that exactly
 #    (the trailing boundary stops 'main' from also matching 'main2').
@@ -396,7 +474,8 @@ function Invoke-RestartMenu {
     Write-Host "  [3] Replace a chat with another chat's history"
     Write-Host "  [4] Restart an account window"
     Write-Host "  [5] Export a chat to Desktop or Downloads"
-    Write-Host "  [6] Exit"
+    Write-Host "  [6] Import a chat from a file"
+    Write-Host "  [7] Exit"
     Write-Host ""
     switch (Read-Host "Choose") {
         '1' { try { Invoke-SetupAccounts } catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
@@ -404,7 +483,8 @@ function Invoke-RestartMenu {
         '3' { try { Invoke-ReplaceChat }   catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '4' { try { Invoke-RestartMenu }   catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '5' { try { Invoke-ExportChat }    catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
-        '6' { break menu }
+        '6' { try { Invoke-ImportChat }    catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
+        '7' { break menu }
         default { }
     }
 }
