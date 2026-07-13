@@ -1,6 +1,5 @@
 $ErrorActionPreference = 'Stop'
 $ProfileRoot = Join-Path $env:LOCALAPPDATA 'Claude-Profiles'
-$DefaultDir  = Join-Path $env:APPDATA 'Claude'
 
 function Pause-Menu { Write-Host ""; Read-Host "Press Enter to go back to the menu" | Out-Null }
 
@@ -61,12 +60,43 @@ function Find-ClaudeExe {
     return $null
 }
 
-# Every Claude window is a data dir. The plain install uses %APPDATA%\Claude;
+# The plain install stores its data in one of these, depending on how Claude was installed:
+#  - direct .exe download: %APPDATA%\Claude
+#  - Microsoft Store / MSIX: %LOCALAPPDATA%\Packages\<PackageFamilyName>\LocalCache\Roaming (or Local)\Claude
+function Resolve-RealDir([string]$p) {
+    try {
+        $it = Get-Item -LiteralPath $p -Force -ErrorAction Stop
+        if ($it.Target) { $t = @($it.Target)[0]; if ($t) { return $t } }  # follow a junction/symlink to its target
+        return $it.FullName
+    } catch { return $p }
+}
+
+function Get-DefaultAccountDirs {
+    # %APPDATA%\Claude is often a junction to the Store package cache, so resolve and de-dupe.
+    $cands = @( (Join-Path $env:APPDATA 'Claude') )
+    try { $pkgs = @(Get-AppxPackage -Name *Claude* -ErrorAction SilentlyContinue) } catch { $pkgs = @() }
+    foreach ($p in $pkgs) {
+        $lc = Join-Path $env:LOCALAPPDATA ('Packages\{0}\LocalCache' -f $p.PackageFamilyName)
+        $cands += (Join-Path $lc 'Roaming\Claude')
+        $cands += (Join-Path $lc 'Local\Claude')
+    }
+    $seen = @{}; $out = @()
+    foreach ($c in $cands) {
+        if (-not (Test-Path (Join-Path $c 'claude-code-sessions'))) { continue }
+        $key = (Resolve-RealDir $c).ToLower()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true; $out += $c
+    }
+    $out
+}
+
+# Every Claude window is a data dir. The plain install is found by Get-DefaultAccountDirs;
 # extra accounts made by this tool live under %LOCALAPPDATA%\Claude-Profiles\<name>.
 function Get-Accounts {
     $dirs = @()
-    if (Test-Path (Join-Path $DefaultDir 'claude-code-sessions')) {
-        $dirs += [pscustomobject]@{ Name='default'; Dir=$DefaultDir; IsDefault=$true }
+    foreach ($d in @(Get-DefaultAccountDirs)) {
+        $nm = if ($d -like '*\Packages\*') { 'default (store)' } else { 'default' }
+        $dirs += [pscustomobject]@{ Name=$nm; Dir=$d; IsDefault=$true }
     }
     if (Test-Path $ProfileRoot) {
         Get-ChildItem $ProfileRoot -Directory | Where-Object {

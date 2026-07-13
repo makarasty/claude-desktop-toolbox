@@ -23,7 +23,7 @@ Double-click `claude-toolbox.bat` and pick from the menu. No arguments needed.
 
 ## Accounts it can see
 
-- Your normal Claude install (`%APPDATA%\Claude`), shown as `default`.
+- Your normal Claude install, shown as `default` — whether it was the direct `.exe` download (`%APPDATA%\Claude`) or the Microsoft Store / MSIX build (`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\...`).
 - Extra accounts made with option 1 (`%LOCALAPPDATA%\Claude-Profiles\<name>`).
 
 ## Notes
