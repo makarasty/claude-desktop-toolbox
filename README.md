@@ -8,6 +8,7 @@ A small menu app for Windows to run several Claude Desktop accounts and move cha
 - **Copy a chat into another account.**
 - **Replace a chat** with another chat's history.
 - **Restart an account window** so moved chats show up.
+- **Export a chat** to Desktop or Downloads as readable text (`.md`) or raw data (`.jsonl`).
 
 ## How it works
 
