@@ -390,6 +390,19 @@ function Read-TranscriptMeta([string]$jsonlPath) {
     [pscustomobject]@{ SessionId=$sid; Cwd=$cwd }
 }
 
+# Pull first/last message times out of a transcript so an imported chat can keep its real dates.
+function Get-TranscriptDates([string]$jsonlPath) {
+    $first = $null; $last = $null
+    foreach ($line in [System.IO.File]::ReadLines($jsonlPath)) {
+        if ($line -notmatch '"timestamp"\s*:\s*"([^"]+)"') { continue }
+        try { $t = [DateTimeOffset]::Parse($Matches[1], [System.Globalization.CultureInfo]::InvariantCulture) } catch { continue }
+        if (-not $first) { $first = $t }
+        $last = $t
+    }
+    if (-not $last) { return $null }
+    [pscustomobject]@{ CreatedAt = $first.ToUnixTimeMilliseconds(); LastAt = $last.ToUnixTimeMilliseconds() }
+}
+
 # Claude names each transcript folder after the cwd, replacing \ / : . _ and spaces with -.
 function Encode-CwdFolder([string]$cwd) { $cwd -replace '[\\/:._ ]', '-' }
 
@@ -437,7 +450,18 @@ function Invoke-ImportChat {
     }
     $o.title = $title
     if ($o.PSObject.Properties['titleSource']) { $o.titleSource = 'user' }
-    Bump-ChatTimestamps $o -IncludeCreated
+    if ((Read-Host "Show it at the top of the chat list? (Y/N, Enter = Y)") -notmatch '^(?i)n') {
+        Bump-ChatTimestamps $o -IncludeCreated
+    } else {
+        $dates = Get-TranscriptDates $pick.FullName
+        if ($dates) {
+            if ($o.PSObject.Properties['createdAt']) { $o.createdAt = $dates.CreatedAt }
+            foreach ($t in 'lastActivityAt','lastFocusedAt') { if ($o.PSObject.Properties[$t]) { $o.$t = $dates.LastAt } }
+        } else {
+            # No dates inside the file; the template's dates would be some other chat's, so top it is.
+            Bump-ChatTimestamps $o -IncludeCreated
+        }
+    }
     foreach ($k in 'enabledMcpTools','remoteMcpServersConfig','alwaysAllowedReasons','sessionPermissionUpdates','writtenBranches') {
         if ($o.PSObject.Properties[$k]) { $o.PSObject.Properties.Remove($k) }
     }
@@ -498,6 +522,19 @@ function Invoke-RestartMenu {
     Restart-Account $acct
 }
 
+function Invoke-BumpChat {
+    Write-Host ""
+    Write-Host "Move a chat to the top of the list" -ForegroundColor Green
+    $acct = Pick-Account "Which account is the chat in?"; if (-not $acct) { return }
+    $chat = Pick-Chat "Pick the chat to move up:" $acct.Dir; if (-not $chat) { return }
+    $o = $chat.Obj
+    Bump-ChatTimestamps $o
+    Write-JsonNoBom $chat.Path $o
+    Write-Host ""
+    Write-Host ("Moved '{0}' to the top." -f $chat.Title) -ForegroundColor Green
+    Offer-Restart $acct
+}
+
 :menu while ($true) {
     Clear-Host
     Write-Host "==============================================" -ForegroundColor DarkCyan
@@ -513,7 +550,8 @@ function Invoke-RestartMenu {
     Write-Host "  [4] Restart an account window"
     Write-Host "  [5] Export a chat to Desktop or Downloads"
     Write-Host "  [6] Import a chat from a file"
-    Write-Host "  [7] Exit"
+    Write-Host "  [7] Move a chat to the top of the list"
+    Write-Host "  [8] Exit"
     Write-Host ""
     switch (Read-Host "Choose") {
         '1' { try { Invoke-SetupAccounts } catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
@@ -522,7 +560,8 @@ function Invoke-RestartMenu {
         '4' { try { Invoke-RestartMenu }   catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '5' { try { Invoke-ExportChat }    catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '6' { try { Invoke-ImportChat }    catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
-        '7' { break menu }
+        '7' { try { Invoke-BumpChat }      catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
+        '8' { break menu }
         default { }
     }
 }

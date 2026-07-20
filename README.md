@@ -10,6 +10,7 @@ A small menu app for Windows to run several Claude Desktop accounts and move cha
 - **Restart an account window** so moved chats show up.
 - **Export a chat** to Desktop or Downloads as readable text (`.md`) or raw data (`.jsonl`).
 - **Import a chat** from a `.jsonl` file — auto-finds them on your Desktop and in Downloads.
+- **Move a chat to the top** of the chat list — resurface an old chat without changing it.
 
 ## How it works
 
@@ -30,7 +31,7 @@ Double-click `claude-toolbox.bat` and pick from the menu. No arguments needed.
 
 - Windows only (needs the Claude desktop app installed).
 - To move a chat into an account, open that account and sign in once first.
-- `Copy` and `Replace` ask whether to show the chat at the top of the list — just press Enter for yes.
+- `Copy`, `Replace` and `Import` ask whether to show the chat at the top of the list — just press Enter for yes. Answering no on `Import` keeps the chat's real dates from the file.
 - `Replace` keeps a `.bak` next to the file it changes, so you can undo.
 
 ## Heads up
