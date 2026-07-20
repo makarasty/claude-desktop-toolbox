@@ -194,6 +194,13 @@ function Render-Readable([string]$jsonlPath, [string]$title) {
     $sb.ToString()
 }
 
+# Claude sorts the sidebar by these timestamps, so bumping them puts the chat at the top of the list.
+function Bump-ChatTimestamps($o, [switch]$IncludeCreated) {
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $fields = @('lastActivityAt', 'lastFocusedAt'); if ($IncludeCreated) { $fields += 'createdAt' }
+    foreach ($t in $fields) { if ($o.PSObject.Properties[$t]) { $o.$t = $now } }
+}
+
 function Pick-Account([string]$prompt) {
     $accts = @(Get-Accounts)
     if ($accts.Count -eq 0) { Write-Host "No Claude accounts found. Use option 1 to set them up first." -ForegroundColor Yellow; return $null }
@@ -295,6 +302,7 @@ function Invoke-CopyChat {
     $o = $chat.Obj
     $o.sessionId = 'local_' + [guid]::NewGuid().ToString()
     if ($rename) { $o.title = $rename; if ($o.PSObject.Properties['titleSource']) { $o.titleSource = 'user' } }
+    if ((Read-Host "Show the copy at the top of the chat list? (Y/N, Enter = Y)") -notmatch '^(?i)n') { Bump-ChatTimestamps $o -IncludeCreated }
     foreach ($k in 'enabledMcpTools','remoteMcpServersConfig','alwaysAllowedReasons','sessionPermissionUpdates') {
         if ($o.PSObject.Properties[$k]) { $o.PSObject.Properties.Remove($k) }
     }
@@ -326,6 +334,7 @@ function Invoke-ReplaceChat {
     Copy-Item $tgt.Path ("{0}.bak" -f $tgt.Path) -Force
     $o = $tgt.Obj
     $o.cliSessionId = $src.cliSessionId
+    if ((Read-Host "Show it at the top of the chat list? (Y/N, Enter = Y)") -notmatch '^(?i)n') { Bump-ChatTimestamps $o }
     Write-JsonNoBom $tgt.Path $o
     Write-Host "Done. Backup saved next to the file (.bak)." -ForegroundColor Green
     Offer-Restart $dstAcct
@@ -428,8 +437,7 @@ function Invoke-ImportChat {
     }
     $o.title = $title
     if ($o.PSObject.Properties['titleSource']) { $o.titleSource = 'user' }
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    foreach ($t in 'createdAt','lastActivityAt','lastFocusedAt') { if ($o.PSObject.Properties[$t]) { $o.$t = $now } }
+    Bump-ChatTimestamps $o -IncludeCreated
     foreach ($k in 'enabledMcpTools','remoteMcpServersConfig','alwaysAllowedReasons','sessionPermissionUpdates','writtenBranches') {
         if ($o.PSObject.Properties[$k]) { $o.PSObject.Properties.Remove($k) }
     }

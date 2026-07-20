@@ -30,6 +30,7 @@ Double-click `claude-toolbox.bat` and pick from the menu. No arguments needed.
 
 - Windows only (needs the Claude desktop app installed).
 - To move a chat into an account, open that account and sign in once first.
+- `Copy` and `Replace` ask whether to show the chat at the top of the list — just press Enter for yes.
 - `Replace` keeps a `.bak` next to the file it changes, so you can undo.
 
 ## Heads up
