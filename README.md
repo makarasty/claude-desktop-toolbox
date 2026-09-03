@@ -11,12 +11,29 @@ A small menu app for Windows to run several Claude Desktop accounts and move cha
 - **Export a chat** to Desktop or Downloads as readable text (`.md`) or raw data (`.jsonl`).
 - **Import a chat** from a `.jsonl` file — auto-finds them on your Desktop and in Downloads.
 - **Move a chat to the top** of the chat list — resurface an old chat without changing it.
+- **Block Claude auto-updates** — stop the app from updating and relaunching itself. Undo from the same menu item.
 
 ## How it works
 
 Each account keeps a small pointer file per chat. The real conversation is stored once and shared by all accounts, so copying a chat is instant and never touches the original.
 
 Claude reads its chat list only when an account starts, so a moved chat appears after you restart that account window. The app can do that for you.
+
+## Blocking auto-updates
+
+Claude Desktop updates itself in the background and force-installs after about 72 hours, which relaunches the app. With several accounts that is worse than an interruption: every account's windows close at the same moment, and the extra ones often fail to come back up. So once more than one account exists, the menu says so and points at the option.
+
+Blocking writes a single value, `disableAutoUpdates`, under `HKCU\SOFTWARE\Policies\Claude` — the policy the app itself reads at launch. With it set, the updater never starts, so nothing is downloaded and the force-install timer never arms. An update already downloaded before you block will still install once.
+
+What you give up: security and compatibility fixes stop arriving on their own, so update by hand when you want to:
+
+```
+winget upgrade --id Anthropic.Claude
+```
+
+The same menu item undoes it. Blocking also pins the winget package, and unblocking unpins it, so `winget upgrade --all` does not quietly put the new build back.
+
+Two things worth knowing. The policy is read at launch, so close every Claude window — tray icon too — and reopen. And if a machine-wide policy exists at `HKLM\SOFTWARE\Policies\Claude`, it overrides the per-user one entirely; the tool detects that and prints the admin commands instead of pretending to have worked.
 
 ## Use
 

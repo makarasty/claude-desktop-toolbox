@@ -535,6 +535,110 @@ function Invoke-BumpChat {
     Offer-Restart $acct
 }
 
+# Claude Desktop reads its own policy from SOFTWARE\Policies\Claude, trying HKCU then HKLM.
+# 'disableAutoUpdates' stops the in-app updater before it starts: nothing is downloaded, so the
+# 72-hour force-install timer never arms and the app never relaunches itself.
+# HKLM wins the whole group: if that key holds ANY value, HKCU is ignored outright.
+$UpdatePolicyKey  = 'SOFTWARE\Policies\Claude'
+$UpdatePolicyName = 'disableAutoUpdates'
+
+function Get-UpdatePolicy {
+    $out = [pscustomobject]@{ Hkcu = $null; Hklm = $null; HklmClaims = $false }
+    foreach ($hive in 'CurrentUser', 'LocalMachine') {
+        $k = $null
+        try { $k = [Microsoft.Win32.Registry]::$hive.OpenSubKey($UpdatePolicyKey) } catch {}
+        if (-not $k) { continue }
+        try {
+            $v = $k.GetValue($UpdatePolicyName)
+            if ($hive -eq 'CurrentUser') { $out.Hkcu = $v }
+            else { $out.Hklm = $v; $out.HklmClaims = ($k.GetValueNames().Count -gt 0) }
+        } finally { $k.Close() }
+    }
+    return $out
+}
+
+# What the app will actually act on, after the HKLM-wins rule.
+function Test-UpdatesBlocked($pol) {
+    if ($pol.HklmClaims) { return ([string]$pol.Hklm -eq '1') }
+    return ([string]$pol.Hkcu -eq '1')
+}
+
+function Show-UpdatePolicy($pol) {
+    if (Test-UpdatesBlocked $pol) { Write-Host "Auto-updates: BLOCKED" -ForegroundColor Green }
+    else { Write-Host "Auto-updates: ON (Claude can update and relaunch itself)" -ForegroundColor Yellow }
+    if ($pol.HklmClaims) {
+        Write-Host "  A machine-wide policy exists at HKLM\$UpdatePolicyKey." -ForegroundColor DarkGray
+        Write-Host "  While it is there, the per-user setting below is ignored." -ForegroundColor DarkGray
+    }
+}
+
+# Best effort only - keeps 'winget upgrade --all' from putting the new build back.
+function Set-WingetPin([switch]$Remove) {
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $winget) { return }
+    $wgArgs = if ($Remove) { @('pin', 'remove', '--id', 'Anthropic.Claude') }
+              else { @('pin', 'add', '--id', 'Anthropic.Claude') }
+    try { & $winget.Source @wgArgs 2>&1 | Out-Null } catch {}
+}
+
+function Invoke-UpdateLock {
+    Write-Host ""
+    Write-Host "Claude auto-updates" -ForegroundColor Green
+    $pol = Get-UpdatePolicy
+    Show-UpdatePolicy $pol
+    Write-Host ""
+
+    if (Test-UpdatesBlocked $pol) {
+        if ($pol.HklmClaims -and [string]$pol.Hklm -eq '1') {
+            Write-Host "That block is machine-wide, so this tool cannot undo it." -ForegroundColor Yellow
+            Write-Host "Remove it from an admin PowerShell:"
+            Write-Host "  Remove-ItemProperty -Path 'HKLM:\$UpdatePolicyKey' -Name '$UpdatePolicyName'"
+            return
+        }
+        Write-Host "Restoring auto-updates puts Claude back to updating and relaunching on its own."
+        if ((Read-Host "Restore auto-updates? (Y/N)") -notmatch '^(?i)y') { Write-Host "Left it blocked."; return }
+        $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($UpdatePolicyKey, $true)
+        if ($k) {
+            try {
+                $k.DeleteValue($UpdatePolicyName, $false)
+                if ($k.GetValueNames().Count -eq 0 -and $k.GetSubKeyNames().Count -eq 0) {
+                    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($UpdatePolicyKey, $false)
+                }
+            } finally { $k.Close() }
+        }
+        Set-WingetPin -Remove
+        Write-Host ""
+        Write-Host "Auto-updates restored." -ForegroundColor Green
+        Write-Host "Takes effect after every Claude window is closed and reopened." -ForegroundColor Cyan
+        return
+    }
+
+    Write-Host "Blocking means:"
+    Write-Host "  - Claude stops downloading updates, so it never force-installs and never relaunches itself."
+    Write-Host "  - Security and compatibility fixes stop arriving. You update by hand:"
+    Write-Host "      winget upgrade --id Anthropic.Claude"
+    Write-Host "  - The device is marked as managed, because this is a policy key."
+    Write-Host "  - Reversible from this same menu option."
+    Write-Host ""
+    if ((Read-Host "Block Claude auto-updates? (Y/N)") -notmatch '^(?i)y') { Write-Host "Cancelled."; return }
+
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($UpdatePolicyKey)
+    try { $k.SetValue($UpdatePolicyName, 1, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $k.Close() }
+    Set-WingetPin
+
+    Write-Host ""
+    Write-Host "Auto-updates blocked." -ForegroundColor Green
+    if ((Get-UpdatePolicy).HklmClaims) {
+        Write-Host "But a machine-wide policy at HKLM\$UpdatePolicyKey overrides it." -ForegroundColor Yellow
+        Write-Host "Set it there too, from an admin PowerShell:"
+        Write-Host "  New-Item -Path 'HKLM:\$UpdatePolicyKey' -Force | Out-Null"
+        Write-Host "  New-ItemProperty -Path 'HKLM:\$UpdatePolicyKey' -Name '$UpdatePolicyName' -PropertyType DWord -Value 1 -Force | Out-Null"
+        return
+    }
+    Write-Host "The policy is read at launch, so close every Claude window - tray icon too - and reopen." -ForegroundColor Cyan
+    Write-Host "An update already downloaded before now will still install once. After that, nothing." -ForegroundColor DarkGray
+}
+
 :menu while ($true) {
     Clear-Host
     Write-Host "==============================================" -ForegroundColor DarkCyan
@@ -543,6 +647,17 @@ function Invoke-BumpChat {
     $accts = @(Get-Accounts)
     if ($accts.Count) { Write-Host ("Accounts: " + (($accts | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join "   ")) -ForegroundColor DarkGray }
     else { Write-Host "No accounts set up yet - start with option 1." -ForegroundColor DarkGray }
+
+    # One update closes every account's windows at once, and the extra accounts often fail to come
+    # back up afterwards. Worth saying out loud once you are running more than one.
+    $pol = $null
+    try { $pol = Get-UpdatePolicy } catch {}
+    if ($pol -and $accts.Count -gt 1 -and -not (Test-UpdatesBlocked $pol)) {
+        Write-Host ""
+        Write-Host "Auto-updates are ON. An update closes every account at once and can leave the extra" -ForegroundColor Yellow
+        Write-Host "ones unable to start. With several accounts, option [8] is worth doing." -ForegroundColor Yellow
+    }
+
     Write-Host ""
     Write-Host "  [1] Set up extra Claude accounts"
     Write-Host "  [2] Copy a chat into another account"
@@ -551,7 +666,9 @@ function Invoke-BumpChat {
     Write-Host "  [5] Export a chat to Desktop or Downloads"
     Write-Host "  [6] Import a chat from a file"
     Write-Host "  [7] Move a chat to the top of the list"
-    Write-Host "  [8] Exit"
+    if ($pol -and (Test-UpdatesBlocked $pol)) { Write-Host "  [8] Claude auto-updates (blocked - undo here)" }
+    else { Write-Host "  [8] Block Claude auto-updates" }
+    Write-Host "  [9] Exit"
     Write-Host ""
     switch (Read-Host "Choose") {
         '1' { try { Invoke-SetupAccounts } catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
@@ -561,7 +678,8 @@ function Invoke-BumpChat {
         '5' { try { Invoke-ExportChat }    catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '6' { try { Invoke-ImportChat }    catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
         '7' { try { Invoke-BumpChat }      catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
-        '8' { break menu }
+        '8' { try { Invoke-UpdateLock }    catch { Write-Host "Error: $_" -ForegroundColor Red }; Pause-Menu }
+        '9' { break menu }
         default { }
     }
 }
