@@ -549,9 +549,12 @@ function Invoke-BumpChat {
 # from HKLM alone and ignores HKCU - so a half-set HKCU value would silently do nothing.
 $UpdatePolicyKey  = 'SOFTWARE\Policies\Claude'
 $UpdatePolicyName = 'disableAutoUpdates'
+# The build that introduced the key. Older Claude builds read no such policy, so writing it there
+# would look like it worked and change nothing.
+$UpdatePolicySince = [version]'1.2581.0'
 
 function Get-UpdatePolicy {
-    $out = [pscustomobject]@{ Hkcu = $null; Hklm = $null; HklmClaims = $false }
+    $out = [pscustomobject]@{ Hkcu = $null; Hklm = $null; HklmClaims = $false; Foreign = @() }
     foreach ($hive in 'CurrentUser', 'LocalMachine') {
         $k = $null
         try { $k = [Microsoft.Win32.Registry]::$hive.OpenSubKey($UpdatePolicyKey) } catch {}
@@ -559,10 +562,28 @@ function Get-UpdatePolicy {
         try {
             $v = $k.GetValue($UpdatePolicyName)
             if ($hive -eq 'CurrentUser') { $out.Hkcu = $v }
-            else { $out.Hklm = $v; $out.HklmClaims = ($k.GetValueNames().Count -gt 0) }
+            else {
+                $out.Hklm = $v
+                $out.HklmClaims = ($k.GetValueNames().Count -gt 0)
+                # Anything under this key that is not ours belongs to somebody else - an employer's
+                # MDM, most likely. Worth saying before we add to it, and worth not deleting on undo.
+                $out.Foreign = @($k.GetValueNames() | Where-Object { $_ -and $_ -ne $UpdatePolicyName })
+            }
         } finally { $k.Close() }
     }
     return $out
+}
+
+# Works for both install shapes: the MSIX package and the direct-download build both carry the app
+# version on Claude.exe itself, so this needs no guess about how Claude got here.
+function Get-ClaudeVersion {
+    $exe = Find-ClaudeExe
+    if (-not $exe) { return $null }
+    try {
+        $vi = (Get-Item $exe).VersionInfo
+        $raw = if ($vi.ProductVersion) { $vi.ProductVersion } else { $vi.FileVersion }
+        return [version](($raw -split '[^0-9.]')[0].Trim('.'))
+    } catch { return $null }
 }
 
 # What the app will actually act on, after the HKLM-wins rule.
@@ -603,13 +624,26 @@ function Invoke-Elevated([string]$body) {
     } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 }
 
-# Best effort only - keeps 'winget upgrade --all' from putting the new build back.
+# Keeps 'winget upgrade --all' from putting the new build back. Only applies when Claude came from
+# winget at all - a direct .exe download is not a winget package and there is nothing to pin, which
+# is worth saying out loud rather than reporting a pin that does not exist.
 function Set-WingetPin([switch]$Remove) {
     $winget = Get-Command winget -ErrorAction SilentlyContinue
-    if (-not $winget) { return }
+    if (-not $winget) { return 'no winget on this PC' }
     $wgArgs = if ($Remove) { @('pin', 'remove', '--id', 'Anthropic.Claude') }
               else { @('pin', 'add', '--id', 'Anthropic.Claude') }
-    try { & $winget.Source @wgArgs 2>&1 | Out-Null } catch {}
+    try {
+        $out = & $winget.Source @wgArgs 2>&1
+        if ($LASTEXITCODE -eq 0) { return $null }
+        if ($out -match 'No installed package found') { return 'Claude was not installed through winget' }
+        return ('winget said: ' + (($out | Select-Object -Last 1) -replace '\s+', ' ').Trim())
+    } catch { return 'winget call failed' }
+}
+
+function Show-PinResult($why, [switch]$Remove) {
+    $what = if ($Remove) { 'unpinned' } else { 'pinned' }
+    if ($why) { Write-Host "The winget package was not $what - $why." -ForegroundColor DarkGray }
+    else { Write-Host "The winget package is $what, so 'winget upgrade --all' leaves it alone." -ForegroundColor DarkGray }
 }
 
 function Invoke-UpdateLock {
@@ -643,10 +677,14 @@ function Invoke-UpdateLock {
   }
 "@
         if (-not $ok) { Write-Host "Nothing changed - auto-updates are still blocked." -ForegroundColor Yellow; return }
-        if (Test-UpdatesBlocked (Get-UpdatePolicy)) { Write-Host "The policy is still in place. Nothing changed." -ForegroundColor Red; return }
-        Set-WingetPin -Remove
+        $after = Get-UpdatePolicy
+        if (Test-UpdatesBlocked $after) { Write-Host "The policy is still in place. Nothing changed." -ForegroundColor Red; return }
+        Show-PinResult (Set-WingetPin -Remove) -Remove
         Write-Host ""
         Write-Host "Auto-updates restored." -ForegroundColor Green
+        if ($after.Foreign.Count) {
+            Write-Host ("Left the rest of the key alone - it still holds: " + ($after.Foreign -join ', ')) -ForegroundColor DarkGray
+        }
         Write-Host "Takes effect after every Claude window is closed and reopened." -ForegroundColor Cyan
         return
     }
@@ -658,6 +696,20 @@ function Invoke-UpdateLock {
     Write-Host "      winget upgrade --id Anthropic.Claude"
     Write-Host "  - The device is marked as managed, because this is a policy key."
     Write-Host "  - Needs administrator rights, and is reversible from this same menu option."
+
+    $ver = Get-ClaudeVersion
+    if ($ver -and $ver -lt $UpdatePolicySince) {
+        Write-Host ""
+        Write-Host ("This Claude is {0}, older than {1}, which is the build that started reading this" -f $ver, $UpdatePolicySince) -ForegroundColor Yellow
+        Write-Host "policy. Setting it here would change nothing until Claude is newer." -ForegroundColor Yellow
+    }
+    if ($pol.Foreign.Count) {
+        Write-Host ""
+        Write-Host ("Careful: HKLM\{0} already carries someone else's settings ({1})." -f $UpdatePolicyKey, ($pol.Foreign -join ', ')) -ForegroundColor Yellow
+        Write-Host "That usually means your employer manages this PC. Blocking adds one value beside" -ForegroundColor Yellow
+        Write-Host "theirs and leaves the rest alone, but their policy may put it back." -ForegroundColor Yellow
+    }
+
     Write-Host ""
     if ((Read-Host "Block Claude auto-updates? (Y/N)") -notmatch '^(?i)y') { Write-Host "Cancelled."; return }
 
@@ -668,7 +720,7 @@ function Invoke-UpdateLock {
 "@
     if (-not $ok) { Write-Host "Nothing changed - auto-updates are still on." -ForegroundColor Yellow; return }
     if (-not (Test-UpdatesBlocked (Get-UpdatePolicy))) { Write-Host "The policy did not take. Auto-updates are still on." -ForegroundColor Red; return }
-    Set-WingetPin
+    Show-PinResult (Set-WingetPin)
 
     Write-Host ""
     Write-Host "Auto-updates blocked for every account on this PC." -ForegroundColor Green

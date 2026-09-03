@@ -39,6 +39,16 @@ The same menu item undoes it, removing the value and the key with it so the mach
 
 Last thing: the policy is read at launch, so close every Claude window — tray icon too — and reopen. The tool reads the key back after writing it and says plainly if it did not take, rather than reporting success it cannot see.
 
+### On someone else's PC
+
+The registry path and the value are the same everywhere, and the tool checks the things that are not:
+
+- **Either install shape works.** The MSIX build (winget or Microsoft Store) and the direct `.exe` download both read the same policy, and the version check reads `Claude.exe` itself rather than assuming how Claude got there.
+- **Old builds are told, not lied to.** Claude only started reading this policy in `1.2581.0`. On anything older the tool says the setting would change nothing, instead of writing it and reporting success.
+- **Work laptops.** If that key already holds settings someone else put there, the tool names them and warns that a managed device may put its own policy back. Blocking adds one value beside theirs; undoing removes only that one value and leaves both the rest and the key itself in place.
+- **Not from winget, no pin.** The winget pin is a bonus, not the mechanism. If Claude came from the direct download there is no winget package to pin, and the tool says so rather than claiming a pin it did not make.
+- **No admin rights, no silent failure.** Dismissing the UAC prompt leaves everything as it was and reports it.
+
 ## Use
 
 Double-click `claude-toolbox.bat` and pick from the menu. No arguments needed.
