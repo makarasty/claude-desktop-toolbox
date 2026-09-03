@@ -538,7 +538,15 @@ function Invoke-BumpChat {
 # Claude Desktop reads its own policy from SOFTWARE\Policies\Claude, trying HKCU then HKLM.
 # 'disableAutoUpdates' stops the in-app updater before it starts: nothing is downloaded, so the
 # 72-hour force-install timer never arms and the app never relaunches itself.
-# HKLM wins the whole group: if that key holds ANY value, HKCU is ignored outright.
+#
+# The setting is not per account. Every extra account is the same Windows user running the same
+# machine-wide install with a different --user-data-dir, and the policy path carries no account in
+# it - so one value covers all of them, and there is nothing to repeat per account.
+#
+# It goes in HKLM, not HKCU, for two reasons. Windows ACLs HKCU\SOFTWARE\Policies to read-only for
+# a standard user (only SYSTEM and Administrators may write), so the per-user hive needs elevation
+# anyway. And if HKLM holds ANY value under this key, the app reads the whole app-behavior group
+# from HKLM alone and ignores HKCU - so a half-set HKCU value would silently do nothing.
 $UpdatePolicyKey  = 'SOFTWARE\Policies\Claude'
 $UpdatePolicyName = 'disableAutoUpdates'
 
@@ -564,12 +572,35 @@ function Test-UpdatesBlocked($pol) {
 }
 
 function Show-UpdatePolicy($pol) {
-    if (Test-UpdatesBlocked $pol) { Write-Host "Auto-updates: BLOCKED" -ForegroundColor Green }
+    if (Test-UpdatesBlocked $pol) { Write-Host "Auto-updates: BLOCKED for every account on this PC" -ForegroundColor Green }
     else { Write-Host "Auto-updates: ON (Claude can update and relaunch itself)" -ForegroundColor Yellow }
-    if ($pol.HklmClaims) {
-        Write-Host "  A machine-wide policy exists at HKLM\$UpdatePolicyKey." -ForegroundColor DarkGray
-        Write-Host "  While it is there, the per-user setting below is ignored." -ForegroundColor DarkGray
+    if ($pol.Hkcu -ne $null -and $pol.HklmClaims) {
+        Write-Host "  A leftover per-user value exists at HKCU\$UpdatePolicyKey; HKLM overrides it." -ForegroundColor DarkGray
     }
+}
+
+function Test-Elevated {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+}
+
+# HKLM\SOFTWARE\Policies needs admin. Run the change in an elevated PowerShell and wait for it.
+# Returns $true only if that process exited 0; a dismissed UAC prompt throws and lands on $false.
+function Invoke-Elevated([string]$body) {
+    if (Test-Elevated) {
+        try { & ([scriptblock]::Create($body)); return $true } catch { Write-Host "Error: $_" -ForegroundColor Red; return $false }
+    }
+    $tmp = Join-Path $env:TEMP ("claude-toolbox-policy-{0}.ps1" -f [guid]::NewGuid().ToString('N'))
+    Write-TextNoBom $tmp ("`$ErrorActionPreference = 'Stop'`ntry {`n$body`n exit 0 } catch { exit 1 }")
+    try {
+        Write-Host "Windows will ask for administrator rights - approve the prompt." -ForegroundColor Cyan
+        $p = Start-Process (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $tmp) -Verb RunAs -Wait -PassThru
+        return ($p.ExitCode -eq 0)
+    } catch {
+        Write-Host "Administrator rights were not granted." -ForegroundColor Yellow
+        return $false
+    } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 }
 
 # Best effort only - keeps 'winget upgrade --all' from putting the new build back.
@@ -589,23 +620,30 @@ function Invoke-UpdateLock {
     Write-Host ""
 
     if (Test-UpdatesBlocked $pol) {
-        if ($pol.HklmClaims -and [string]$pol.Hklm -eq '1') {
-            Write-Host "That block is machine-wide, so this tool cannot undo it." -ForegroundColor Yellow
-            Write-Host "Remove it from an admin PowerShell:"
-            Write-Host "  Remove-ItemProperty -Path 'HKLM:\$UpdatePolicyKey' -Name '$UpdatePolicyName'"
-            return
-        }
-        Write-Host "Restoring auto-updates puts Claude back to updating and relaunching on its own."
+        Write-Host "Restoring auto-updates puts Claude back to updating and relaunching on its own,"
+        Write-Host "for every account on this PC."
         if ((Read-Host "Restore auto-updates? (Y/N)") -notmatch '^(?i)y') { Write-Host "Left it blocked."; return }
-        $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($UpdatePolicyKey, $true)
-        if ($k) {
-            try {
-                $k.DeleteValue($UpdatePolicyName, $false)
-                if ($k.GetValueNames().Count -eq 0 -and $k.GetSubKeyNames().Count -eq 0) {
-                    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($UpdatePolicyKey, $false)
-                }
-            } finally { $k.Close() }
-        }
+
+        # Drop the value, and the key too if it is then empty - an empty key left behind would still
+        # read as a managed device.
+        $ok = Invoke-Elevated @"
+  `$k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('$UpdatePolicyKey', `$true)
+  if (`$k) {
+    `$k.DeleteValue('$UpdatePolicyName', `$false)
+    `$empty = (`$k.GetValueNames().Count -eq 0 -and `$k.GetSubKeyNames().Count -eq 0)
+    `$k.Close()
+    if (`$empty) { [Microsoft.Win32.Registry]::LocalMachine.DeleteSubKey('$UpdatePolicyKey', `$false) }
+  }
+  `$u = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('$UpdatePolicyKey', `$true)
+  if (`$u) {
+    `$u.DeleteValue('$UpdatePolicyName', `$false)
+    `$empty = (`$u.GetValueNames().Count -eq 0 -and `$u.GetSubKeyNames().Count -eq 0)
+    `$u.Close()
+    if (`$empty) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey('$UpdatePolicyKey', `$false) }
+  }
+"@
+        if (-not $ok) { Write-Host "Nothing changed - auto-updates are still blocked." -ForegroundColor Yellow; return }
+        if (Test-UpdatesBlocked (Get-UpdatePolicy)) { Write-Host "The policy is still in place. Nothing changed." -ForegroundColor Red; return }
         Set-WingetPin -Remove
         Write-Host ""
         Write-Host "Auto-updates restored." -ForegroundColor Green
@@ -615,26 +653,25 @@ function Invoke-UpdateLock {
 
     Write-Host "Blocking means:"
     Write-Host "  - Claude stops downloading updates, so it never force-installs and never relaunches itself."
+    Write-Host "  - One setting covers every account on this PC. There is nothing to repeat per account."
     Write-Host "  - Security and compatibility fixes stop arriving. You update by hand:"
     Write-Host "      winget upgrade --id Anthropic.Claude"
     Write-Host "  - The device is marked as managed, because this is a policy key."
-    Write-Host "  - Reversible from this same menu option."
+    Write-Host "  - Needs administrator rights, and is reversible from this same menu option."
     Write-Host ""
     if ((Read-Host "Block Claude auto-updates? (Y/N)") -notmatch '^(?i)y') { Write-Host "Cancelled."; return }
 
-    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($UpdatePolicyKey)
-    try { $k.SetValue($UpdatePolicyName, 1, [Microsoft.Win32.RegistryValueKind]::DWord) } finally { $k.Close() }
+    $ok = Invoke-Elevated @"
+  `$k = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('$UpdatePolicyKey')
+  `$k.SetValue('$UpdatePolicyName', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
+  `$k.Close()
+"@
+    if (-not $ok) { Write-Host "Nothing changed - auto-updates are still on." -ForegroundColor Yellow; return }
+    if (-not (Test-UpdatesBlocked (Get-UpdatePolicy))) { Write-Host "The policy did not take. Auto-updates are still on." -ForegroundColor Red; return }
     Set-WingetPin
 
     Write-Host ""
-    Write-Host "Auto-updates blocked." -ForegroundColor Green
-    if ((Get-UpdatePolicy).HklmClaims) {
-        Write-Host "But a machine-wide policy at HKLM\$UpdatePolicyKey overrides it." -ForegroundColor Yellow
-        Write-Host "Set it there too, from an admin PowerShell:"
-        Write-Host "  New-Item -Path 'HKLM:\$UpdatePolicyKey' -Force | Out-Null"
-        Write-Host "  New-ItemProperty -Path 'HKLM:\$UpdatePolicyKey' -Name '$UpdatePolicyName' -PropertyType DWord -Value 1 -Force | Out-Null"
-        return
-    }
+    Write-Host "Auto-updates blocked for every account on this PC." -ForegroundColor Green
     Write-Host "The policy is read at launch, so close every Claude window - tray icon too - and reopen." -ForegroundColor Cyan
     Write-Host "An update already downloaded before now will still install once. After that, nothing." -ForegroundColor DarkGray
 }

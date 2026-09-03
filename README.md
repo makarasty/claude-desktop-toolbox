@@ -23,7 +23,11 @@ Claude reads its chat list only when an account starts, so a moved chat appears 
 
 Claude Desktop updates itself in the background and force-installs after about 72 hours, which relaunches the app. With several accounts that is worse than an interruption: every account's windows close at the same moment, and the extra ones often fail to come back up. So once more than one account exists, the menu says so and points at the option.
 
-Blocking writes a single value, `disableAutoUpdates`, under `HKCU\SOFTWARE\Policies\Claude` — the policy the app itself reads at launch. With it set, the updater never starts, so nothing is downloaded and the force-install timer never arms. An update already downloaded before you block will still install once.
+Blocking writes a single value, `disableAutoUpdates`, under `HKLM\SOFTWARE\Policies\Claude` — the policy the app itself reads at launch. With it set, the updater never starts, so nothing is downloaded and the force-install timer never arms. An update already downloaded before you block will still install once.
+
+**It is one setting for the whole PC, not one per account.** Extra accounts are the same Windows user running the same machine-wide install with a different `--user-data-dir`, and the policy path has no account in it. Set it once and every account is covered; there is nothing to repeat when you add another.
+
+Windows asks for administrator rights, because `SOFTWARE\Policies` is writable only by SYSTEM and Administrators — that holds in `HKCU` too, so the per-user hive would need elevation anyway. `HKLM` is also the hive the app trusts: if it holds any value under this key, the app reads the whole app-behavior group from there and ignores `HKCU` outright, which is how a per-user value ends up silently doing nothing.
 
 What you give up: security and compatibility fixes stop arriving on their own, so update by hand when you want to:
 
@@ -31,9 +35,9 @@ What you give up: security and compatibility fixes stop arriving on their own, s
 winget upgrade --id Anthropic.Claude
 ```
 
-The same menu item undoes it. Blocking also pins the winget package, and unblocking unpins it, so `winget upgrade --all` does not quietly put the new build back.
+The same menu item undoes it, removing the value and the key with it so the machine stops reading as managed. Blocking also pins the winget package, and unblocking unpins it, so `winget upgrade --all` does not quietly put the new build back.
 
-Two things worth knowing. The policy is read at launch, so close every Claude window — tray icon too — and reopen. And if a machine-wide policy exists at `HKLM\SOFTWARE\Policies\Claude`, it overrides the per-user one entirely; the tool detects that and prints the admin commands instead of pretending to have worked.
+Last thing: the policy is read at launch, so close every Claude window — tray icon too — and reopen. The tool reads the key back after writing it and says plainly if it did not take, rather than reporting success it cannot see.
 
 ## Use
 
